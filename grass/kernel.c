@@ -63,6 +63,12 @@ static void excp_entry(uint id) {
     /* Student's code goes here (System Call & Protection | Virtual Memory). */
 
     /* Kill the current process if curr_pid is a user application. */
+    if (curr_pid >= GPID_USER_START) {
+        printf("Process %d killed due to exception %d\n", curr_pid, id);
+        proc_free(curr_pid);
+        proc_yield();
+        return;
+    }
 
     /* Student's code ends here. */
     FATAL("excp_entry: kernel got exception %d", id);
@@ -73,6 +79,23 @@ static void intr_entry(uint id) {
     /* Student's code goes here (Preemptive Scheduler). */
 
     /* Update the process lifecycle statistics. */
+    if (curr_proc_idx > 0 && curr_proc_idx <= MAX_NPROCESS) {
+        struct process* curr_proc = &proc_set[curr_proc_idx];
+        curr_proc->timer_interrupt_count++;
+        
+        // Update CPU time for current process
+        ulonglong current_time = mtime_get();
+        if (curr_proc->last_schedule_time > 0) {
+            ulonglong runtime = current_time - curr_proc->last_schedule_time;
+            curr_proc->total_cpu_time += runtime;  // THIS LINE SHOULD WORK
+            
+            // Update MLFQ level based on runtime
+            mlfq_update_level(curr_proc, runtime);
+        }
+        
+        // Update last_schedule_time for next calculation
+        curr_proc->last_schedule_time = current_time;  // IMPORTANT!
+    }
 
     /* Student's code ends here. */
     proc_yield();
@@ -89,14 +112,55 @@ static void proc_yield() {
      * [System Call & Protection]
      * Do not schedule a process that should still be sleeping at this time. */
 
+    // Call MLFQ reset (Rule 5)
+    mlfq_reset_level();
+
     int next_idx = MAX_NPROCESS;
+    int min_level = MLFQ_LEVELS; // Start with worst possible level
+    ulonglong current_time = mtime_get();
+
+    // MLFQ Scheduler: Find runnable process with lowest level number (Rule 1)
     for (uint i = 1; i <= MAX_NPROCESS; i++) {
-        struct process* p = &proc_set[(curr_proc_idx + i) % MAX_NPROCESS];
+        struct process* p = &proc_set[i];
+        
+        // Check if process should wake up from sleep
+        if (p->status == PROC_PENDING_SYSCALL && p->wakeup_time > 0 && 
+            current_time >= p->wakeup_time) {
+            p->wakeup_time = 0;
+            p->status = PROC_RUNNABLE;
+        }
+
         if (p->status == PROC_PENDING_SYSCALL) proc_try_syscall(p);
 
-        if (p->status == PROC_READY || p->status == PROC_RUNNABLE) {
-            next_idx = (curr_proc_idx + i) % MAX_NPROCESS;
-            break;
+        // Skip processes that are sleeping
+        if (p->wakeup_time > 0 && current_time < p->wakeup_time) {
+            continue;
+        }
+
+        // MLFQ: Select process with lowest queue level (highest priority)
+        if ((p->status == PROC_READY || p->status == PROC_RUNNABLE) && 
+            p->queue_level < min_level) {
+            min_level = p->queue_level;
+            next_idx = i;
+        }
+    }
+
+    // If no high priority process found, find any runnable process
+    if (next_idx == MAX_NPROCESS) {
+        for (uint i = 1; i <= MAX_NPROCESS; i++) {
+            struct process* p = &proc_set[i];
+            
+            if (p->status == PROC_PENDING_SYSCALL) proc_try_syscall(p);
+
+            // Skip sleeping processes
+            if (p->wakeup_time > 0 && current_time < p->wakeup_time) {
+                continue;
+            }
+
+            if (p->status == PROC_READY || p->status == PROC_RUNNABLE) {
+                next_idx = i;
+                break;
+            }
         }
     }
 
@@ -105,6 +169,32 @@ static void proc_yield() {
          * Measure and record lifecycle statistics for the *next* process.
          * [System Call & Protection | Multicore & Locks]
          * Modify mstatus.MPP to enter machine or user mode after mret. */
+        
+        struct process* next_proc = &proc_set[next_idx];
+        
+        // Update lifecycle statistics for next process
+        if (next_proc->first_schedule_time == 0) {
+            next_proc->first_schedule_time = mtime_get();
+        }
+        next_proc->last_schedule_time = mtime_get();
+
+        // Set mstatus.MPP to user mode for user processes
+        if (next_proc->pid >= GPID_USER_START) {
+            asm("csrr t0, mstatus");
+            asm("li t1, ~(3 << 11)");  // Clear MPP bits
+            asm("and t0, t0, t1");
+            asm("li t1, (0 << 11)");   // Set MPP to user mode (0)
+            asm("or t0, t0, t1");
+            asm("csrw mstatus, t0");
+        } else {
+            // Set mstatus.MPP to machine mode for kernel processes
+            asm("csrr t0, mstatus");
+            asm("li t1, ~(3 << 11)");  // Clear MPP bits
+            asm("and t0, t0, t1");
+            asm("li t1, (3 << 11)");   // Set MPP to machine mode (3)
+            asm("or t0, t0, t1");
+            asm("csrw mstatus, t0");
+        }
 
     } else {
         /* [Multicore & Locks]
@@ -114,7 +204,20 @@ static void proc_yield() {
          * Enable interrupts by setting the mstatus.MIE bit to 1;
          * Wait for the next interrupt using the wfi instruction. */
 
-        FATAL("proc_yield: no process to run on core %d", core_in_kernel);
+        // No process to run, become idle
+        curr_proc_idx = 0;
+        earth->timer_reset(core_in_kernel);
+        
+        // Enable interrupts
+        asm("csrr t0, mstatus");
+        asm("ori t0, t0, 0x8");  // Set MIE bit
+        asm("csrw mstatus, t0");
+        
+        // Wait for interrupt
+        asm("wfi");
+        return;
+
+        // FATAL("proc_yield: no process to run on core %d", core_in_kernel);
     }
     /* Student's code ends here. */
 
